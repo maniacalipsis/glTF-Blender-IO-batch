@@ -106,6 +106,7 @@ def on_export_format_changed(self, context):
     sfile.params.filename = ensure_filepath_matches_export_format(
         sfile.params.filename,
         self.export_format,
+        self.file_format_exts,
     )
 
     # Also change the filter
@@ -690,6 +691,7 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
         self.filepath = ensure_filepath_matches_export_format(
             self.filepath,
             self.export_format,
+            self.file_format_exts,
         )
         return self.filepath != old_filepath
 
