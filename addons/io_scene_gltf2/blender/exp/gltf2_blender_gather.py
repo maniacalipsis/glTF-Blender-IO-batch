@@ -49,7 +49,7 @@ def gather_gltf2(export_settings):
     return active_scene, scenes, animations
 
 
-@cached
+#@cached    #WARNING: This caching makes impossible to export different sets of objects into separate files.
 def __gather_scene(blender_scene, export_settings):
     scene = gltf2_io.Scene(
         extensions=None,

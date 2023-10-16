@@ -71,7 +71,7 @@ exporter_extension_panel_unregister_functors = []
 importer_extension_panel_unregister_functors = []
 
 
-def ensure_filepath_matches_export_format(filepath, export_format):
+def ensure_filepath_matches_export_format(filepath, export_format, file_format_exts):
     import os
     filename = os.path.basename(filepath)
     if not filename:
@@ -81,9 +81,9 @@ def ensure_filepath_matches_export_format(filepath, export_format):
     if stem.startswith('.') and not ext:
         stem, ext = '', stem
 
-    desired_ext = '.glb' if export_format == 'GLB' else '.gltf'
+    desired_ext = file_format_exts[export_format]
     ext_lower = ext.lower()
-    if ext_lower not in ['.glb', '.gltf']:
+    if ext_lower not in file_format_exts.values():
         return filepath + desired_ext
     elif ext_lower != desired_ext:
         filepath = filepath[:-len(ext)]  # strip off ext
@@ -109,7 +109,7 @@ def on_export_format_changed(self, context):
     )
 
     # Also change the filter
-    sfile.params.filter_glob = '*.glb' if self.export_format == 'GLB' else '*.gltf'
+    sfile.params.filter_glob = '*'+self.file_format_exts[self.export_format]
     # Force update of file list, because update the filter does not update the real file list
     bpy.ops.file.refresh()
 
@@ -136,6 +136,9 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
         self.is_draco_available = gltf2_io_draco_compression_extension.dll_exists()
 
     bl_options = {'PRESET'}
+    file_format_exts={'GLB':'.glb','GLTF_SEPARATE':'.gltf','GLTF_EMBEDDED':'.gltf'}
+    batch_replace_regex=None
+    batch_counter=0
 
     # Don't use export_ prefix here, I don't want it to be saved with other export settings
     gltf_export_id: StringProperty(
@@ -145,6 +148,43 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
             'Can be useful in case of Extension added by other add-ons'
         ),
         default=''
+    )
+        
+    export_mode: EnumProperty(
+        name='Batch',
+        items=(('BATCH_NONE','-None-','Ordinary export.'),
+               ('BATCH_COLL','Batch collections','Exports each collection to separate file, named like the collection.\nIf Include > Limit To > Active Collection checked, then export collections within the active one.'),
+               ("BATCH_OBJ" ,'Batch objects','Exports each object to separate file, named like the object.\nOptons Include > Limit To works similarly as in Single file mode')),
+        description='How to export',
+        default='BATCH_NONE'
+    )
+    
+    export_rename_regexp: StringProperty(
+        name='RegExp',
+        description='RegExp pattern for renaming the collection/object into the output file name.',
+        default=''
+    )
+    
+    export_rename_replacement: StringProperty(
+        name='Replacement',
+        description=('Replacement for renaming the collection/object into the output file name.\n'
+                     'Subpattern matches: "\\1", "\\2" etc.\n'
+                     'File enumeration:\n'
+                     '   "{:}" -decimal, "{:x}" - hex lowercase, "{:X}" - hex uppercase, "{:o}" - oct and "{:b}" - binary;\n'
+                     '   "{:04X}" - 4 hex places with leading zeros.'),
+        default=''
+    )
+        
+    export_rename_enumeration_start: IntProperty(
+        name='Enum start',
+        description='Enumeration counter initial value. Integer.',
+        default=0
+    )
+    
+    export_rename_enumeration_step: IntProperty(
+        name='Enum step',
+        description='Enumeration counter step. Integer.',
+        default=1
     )
 
     export_format: EnumProperty(
@@ -664,7 +704,7 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
 
                 # Update filter if user saved settings
                 if hasattr(self, 'export_format'):
-                    self.filter_glob = '*.glb' if self.export_format == 'GLB' else '*.gltf'
+                    self.filter_glob = '*'+self.file_format_exts[self.export_format]
 
             except (AttributeError, TypeError):
                 self.report({"ERROR"}, "Loading export settings failed. Removed corrupted settings")
@@ -717,6 +757,11 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
         export_settings = {}
 
         export_settings['timestamp'] = datetime.datetime.now()
+        export_settings['export_mode'] = self.export_mode
+        export_settings['export_rename_regexp'] = self.export_rename_regexp
+        export_settings['export_rename_replacement'] = self.export_rename_replacement
+        export_settings['export_rename_enumeration_start'] = self.export_rename_enumeration_start
+        export_settings['export_rename_enumeration_step']  = self.export_rename_enumeration_step
         export_settings['gltf_export_id'] = self.gltf_export_id
         export_settings['gltf_filepath'] = self.filepath
         export_settings['gltf_filedirectory'] = os.path.dirname(export_settings['gltf_filepath']) + '/'
@@ -860,7 +905,75 @@ class ExportGLTF2_Base(ConvertGLTF2_Base):
         export_settings['pre_export_callbacks'] = pre_export_callbacks
         export_settings['post_export_callbacks'] = post_export_callbacks
 
-        return gltf2_blender_export.save(context, export_settings)
+        #TODO: Batching with GLTF_SEPARATE format works incorrectly: only one *.bin file is producing.
+        match export_settings['export_mode']:
+            case 'BATCH_NONE':  #Export to a single file (the original behaviour):
+                gltf2_blender_export.save(context, export_settings)
+            case 'BATCH_COLL':  #Export collections into a separate files:
+                #Save state:
+                active_collection_swap=bpy.context.view_layer.active_layer_collection   #Stash active collection value.
+                #Get entry point:
+                if not export_settings['gltf_active_collection']:                       #If the filtering by collection is set explicitly (with or without nested),
+                    entry_collection=bpy.context.view_layer.active_layer_collection     # then export the active collection child collections.
+                else:                                                                   # else
+                    entry_collection=bpy.context.view_layer.layer_collection            # export the top-level collection child collections,
+                    export_settings['gltf_active_collection']=export_settings['gltf_active_collection_with_nested']=True   # forcing the filtering to gather objects from all nested collections too.
+                #Export:
+                self.batch_prepare()
+                for collection in entry_collection.children:
+                    export_settings['gltf_filepath']=self.batch_make_file_path(export_settings['gltf_filedirectory'],collection.name)
+                    bpy.context.view_layer.active_layer_collection=collection           #Set current collection active.
+                    gltf2_blender_export.save(context, export_settings)
+                #Restore state:
+                bpy.context.view_layer.active_layer_collection=active_collection_swap   #Restore active collection value.
+            case 'BATCH_OBJ':  #Export objects into a separate files:
+                #Save state:
+                sel_objects_swap=bpy.context.selected_objects               #Stash selected objects list.
+                #Get exporting objects:
+                if export_settings['gltf_active_collection']:
+                    export_list=bpy.context.collection.all_objects if export_settings['gltf_active_collection_with_nested'] else bpy.context.collection.objects
+                elif export_settings['gltf_selected']:
+                    export_list=bpy.context.selected_objects
+                else:
+                    export_list=bpy.data.objects
+                    
+                #Export:
+                self.batch_prepare()
+                export_settings['gltf_selected']=True                       #Force the filtering to gather selected object.
+                bpy.ops.object.select_all(action='DESELECT')                #Reset the original selection.
+                for obj in export_list:                                     #Select objects in list 
+                    obj.select_set(True)                                    # one by one
+                    export_settings['gltf_filepath']=self.batch_make_file_path(export_settings['gltf_filedirectory'],obj.name)
+                    gltf2_blender_export.save(context, export_settings)     # and export each into a separate file.
+                    obj.select_set(False)                                   #Then, dont forget deselect it back.
+                #Restore state:
+                for obj in sel_objects_swap:                                #Restore original selection.
+                    obj.select_set(True)
+            case other:
+                print('Unrecognized option export_mode='+export_settings['export_mode'])
+        return {'FINISHED'}
+        
+
+    def batch_prepare(self):
+        import re
+        if self.export_rename_regexp:
+            self.batch_replace_regex=re.compile(self.export_rename_regexp)
+        self.batch_counter=self.export_rename_enumeration_start
+    
+    
+    def batch_make_file_path(self,directory,entity_name):
+        import os
+        fname=entity_name
+        #Rename:
+        if self.batch_replace_regex:
+            fname=self.batch_replace_regex.sub(self.export_rename_replacement,fname)
+        #Enumerate:
+        if self.export_rename_replacement:
+            fname=fname.format(self.batch_counter)
+            self.batch_counter+=self.export_rename_enumeration_step
+        #Concat path:
+        return os.path.join(directory,fname+self.file_format_exts[self.export_format])
+    
 
     def draw(self, context):
         pass # Is needed to get panels available
@@ -887,7 +1000,14 @@ class GLTF_PT_export_main(bpy.types.Panel):
 
         sfile = context.space_data
         operator = sfile.active_operator
-
+        
+        layout.prop(operator, 'export_mode')
+        if operator.export_mode!='BATCH_NONE':
+            layout.prop(operator, 'export_rename_regexp')
+            layout.prop(operator, 'export_rename_replacement')
+            layout.prop(operator, 'export_rename_enumeration_start')
+            layout.prop(operator, 'export_rename_enumeration_step')
+  
         layout.prop(operator, 'export_format')
         if operator.export_format == 'GLTF_SEPARATE':
             layout.prop(operator, 'export_keep_originals')
